@@ -69,6 +69,10 @@ $PrivGroups   = @($Cfg.PrivilegedGroups)
 $Checks       = if ($Cfg.Checks) { $Cfg.Checks } else { @{} }
 $OnlyList     = if ($Only) { $Only -split '[,\s]+' } else { @() }
 $SkipList     = if ($Skip) { $Skip -split '[,\s]+' } else { @() }
+$ProcCreateCfg= if ($Cfg.ProcCreate) { $Cfg.ProcCreate } else { @{} }
+$MemScanCfg   = if ($Cfg.MemScan) { $Cfg.MemScan } else { @{} }
+$TrustedPeers = @($Cfg.TrustedInternalPeers)
+$FirewallLog  = if ($Cfg.FirewallLog) { $Cfg.FirewallLog } else { 'C:\Windows\System32\LogFiles\Firewall\pfirewall.log' }
 
 if (-not $Baseline -and -not $Watch -and -not $Stop -and -not $Status) { $Once = $true }
 
@@ -241,6 +245,16 @@ function Get-EventsSafe($log, $id, $minutes) {
     return $fresh
 }
 
+# Pull a named field out of an event's EventData, trying several names so the same
+# code reads both the Security-4688 and Sysmon schemas. $data is $xml.Event.EventData.Data.
+function Get-EventField($data, [string[]]$names) {
+    foreach ($n in $names) {
+        $v = ($data | Where-Object { $_.Name -eq $n }).'#text'
+        if ($null -ne $v -and $v -ne '') { return $v }
+    }
+    return $null
+}
+
 # --------------------------------------------------------------------------
 # Response layer - gated by RespondMode + confidence. Fail-open on scored ports.
 # --------------------------------------------------------------------------
@@ -367,14 +381,60 @@ function Get-Outbound {
     }
 }
 
+# A dropped/injected binary's signature + path are the same suspicion signals the
+# public-egress check uses; factored out so InternalBeacon can reuse them.
+function Get-ProcSig($path) {
+    if (-not $path) { return 'NoPath' }
+    try { return (Get-AuthenticodeSignature $path -EA Stop).Status } catch { return 'Unknown' }
+}
+function Test-TempPath($path) { return ($path -and ($path -match 'Temp|AppData|ProgramData|\\Users\\Public|\\Downloads')) }
+
+# Internal peers this host is talking to, minus loopback/self and the configured
+# trusted set. Public peers are Det-Egress's job; this is the RFC1918 blind spot.
+function Get-OutboundInternal {
+    try { $conns = Get-NetTCPConnection -State Established,SynSent -ErrorAction Stop } catch { return @() }
+    foreach ($c in $conns) {
+        $ip = $c.RemoteAddress
+        if (-not $ip -or (Test-PublicIP $ip)) { continue }
+        if ($ip -match '^(127\.|::1$|0\.0\.0\.0$|::$|fe80:|169\.254\.)') { continue }
+        $trusted = $false
+        foreach ($t in $TrustedPeers) { if ($t -and $ip.StartsWith($t)) { $trusted = $true; break } }
+        if ($trusted) { continue }
+        $pr = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            OwnPid = $c.OwningProcess
+            Name   = if ($pr) { $pr.Name } else { '?' }
+            Path   = if ($pr) { $pr.Path } else { $null }
+            Remote = $ip
+            Port   = $c.RemotePort
+        }
+    }
+}
+
 function Det-Egress {
     foreach ($o in (Get-Outbound)) {
-        $sig = if ($o.Path) { try { (Get-AuthenticodeSignature $o.Path -EA Stop).Status } catch { 'Unknown' } } else { 'NoPath' }
-        $tempish = $o.Path -and ($o.Path -match 'Temp|AppData|ProgramData|\\Users\\Public|\\Downloads')
+        $sig = Get-ProcSig $o.Path
+        $tempish = Test-TempPath $o.Path
         if ($sig -ne 'Valid' -or $tempish) {
             Alert 'Egress' 'high' "outbound $($o.Remote):$($o.Port) from $($o.Name) (pid=$($o.OwnPid)) path=$($o.Path) sig=$sig"
             Resp-Sever $o.Remote $o.Port
             Resp-Kill $o.OwnPid $o.Name
+        }
+    }
+}
+
+# #3 A suspicious process (unsigned / temp-path / LOLBin) beaconing to a
+# non-trusted internal peer. Only fires when the *process* is itself suspect, so a
+# normal signed system service talking on the LAN stays silent -- keeps FP low
+# while closing the internal-C2 / pivot / redirector gap. WARN, never auto-acts.
+function Det-InternalBeacon {
+    foreach ($o in (Get-OutboundInternal)) {
+        $sig = Get-ProcSig $o.Path
+        $tempish = Test-TempPath $o.Path
+        $lol = $Lolbins -contains $o.Name
+        if ($sig -ne 'Valid' -or $tempish -or $lol) {
+            $why = @(); if ($sig -ne 'Valid') { $why += "sig=$sig" }; if ($tempish) { $why += 'temp-path' }; if ($lol) { $why += 'lolbin' }
+            Warn 'InternalBeacon' "suspicious process to non-trusted internal peer $($o.Remote):$($o.Port) from $($o.Name) (pid=$($o.OwnPid)) [$(($why) -join ',')] path=$($o.Path)"
         }
     }
 }
@@ -420,6 +480,20 @@ function Det-Firewall {
         Alert 'Firewall' 'high' "firewall profile(s) disabled: $(($off | Select-Object -Expand Name) -join ',') (T1562.004 egress-freeing tamper)"
         Resp-Firewall
     }
+    # #3 If T0 had outbound default-deny and it has since flipped to Allow, someone
+    # freed egress for a beacon. Baseline line format: Name=Enabled,DefaultOutboundAction
+    $bf = Join-Path $BaselineDir 'firewall.txt'
+    if (Test-Path $bf) {
+        $base = @{}
+        foreach ($ln in (Get-Content $bf)) {
+            if ($ln -match '^(\w+)=[^,]+,(\w+)') { $base[$Matches[1]] = $Matches[2] }
+        }
+        foreach ($p in $profs) {
+            if ($base[$p.Name] -eq 'Block' -and "$($p.DefaultOutboundAction)" -ne 'Block') {
+                Alert 'Firewall' 'high' "outbound default-action on '$($p.Name)' changed from Block to $($p.DefaultOutboundAction) since T0 (egress freed)"
+            }
+        }
+    }
 }
 
 function Det-PortProxy {
@@ -455,6 +529,174 @@ function Det-DnsTunnel {
         $label = ($r.Name -split '\.')[0]
         if ($label.Length -gt 25 -or (Get-Entropy $label) -gt 3.8) {
             Warn 'DnsTunnel' "high-entropy/long DNS label (possible tunnel): $($r.Name)"
+        }
+    }
+}
+
+# #1 -------------------------------------------------------------------------
+# Launch-time process telemetry. The sweep loop is a poller and can never see the
+# instant a beacon starts; the OS can, via Security 4688 (with command-line
+# auditing) or Sysmon EID 1. This reads both and alerts on the launch patterns a
+# stager cannot avoid: an office/script host spawning an interpreter, an encoded
+# PowerShell command, or an image running from a drop path. It never auto-kills --
+# a wrong kill on powershell.exe is worse than the WARN.
+function Det-ProcCreate {
+    $parents  = @($ProcCreateCfg.SuspectParents)
+    $children = @($ProcCreateCfg.SuspectChildren)
+    $paths    = if ($ProcCreateCfg.SuspectPaths) { $ProcCreateCfg.SuspectPaths } else { 'Temp|AppData|\\Downloads' }
+    $cap      = if ($ProcCreateCfg.MaxPerSweep) { [int]$ProcCreateCfg.MaxPerSweep } else { 500 }
+
+    $events = @(Get-EventsSafe 'Security' 4688 $LookbackMin) +
+              @(Get-EventsSafe 'Microsoft-Windows-Sysmon/Operational' 1 $LookbackMin)
+    $n = 0
+    foreach ($e in $events) {
+        if ($n -ge $cap) { break }; $n++
+        try { $x = [xml]$e.ToXml() } catch { continue }
+        $data     = $x.Event.EventData.Data
+        $img      = Get-EventField $data @('NewProcessName','Image')
+        $parent   = Get-EventField $data @('ParentProcessName','ParentImage')
+        $cmd      = Get-EventField $data @('CommandLine','ProcessCommandLine')
+        if (-not $img) { continue }
+        $leaf     = Split-Path $img -Leaf
+        $child    = ($leaf   -replace '\.exe$','').ToLower()
+        $pname    = if ($parent) { (Split-Path $parent -Leaf) -replace '\.exe$','' } else { '' }
+        $pname    = $pname.ToLower()
+        $c        = "$cmd"
+
+        $encoded = $c -match '(?i)(-enc(odedcommand)?\b|\s-e\s+[A-Za-z0-9+/=]{20,}|FromBase64String|Invoke-Expression|\bIEX\b|DownloadString|DownloadData|Net\.WebClient|-nop\b.*-w(indowstyle)?\s+hidden|hidden.*-nop)'
+        if ($encoded) {
+            Alert 'ProcCreate' 'high' "encoded/obfuscated launch: $pname -> $leaf :: $(Limit-Str $c 300)"
+            continue
+        }
+        if (($parents -contains $pname) -and ($children -contains $child)) {
+            Alert 'ProcCreate' 'high' "suspicious lineage: $pname spawned $leaf :: $(Limit-Str $c 300)"
+            continue
+        }
+        if ($img -match $paths) {
+            $sig = Get-ProcSig $img
+            if ($sig -ne 'Valid') { Alert 'ProcCreate' 'high' "unsigned image launched from drop path: $img (sig=$sig) :: $(Limit-Str $c 200)" }
+            else { Warn 'ProcCreate' "signed image launched from drop path: $img :: $(Limit-Str $c 200)" }
+            continue
+        }
+        if (($children -contains $child) -and ($c -match '(?i)https?://|\\\\[^ ]+\\|-w(indowstyle)?\s+hidden')) {
+            Warn 'ProcCreate' "interpreter with network/hidden args: $pname -> $leaf :: $(Limit-Str $c 200)"
+        }
+    }
+}
+function Limit-Str([string]$s, [int]$max) { if ($null -eq $s) { return '' }; if ($s.Length -le $max) { return $s }; return $s.Substring(0, $max) + '...' }
+
+# #2 -------------------------------------------------------------------------
+# In-memory injection scan. Point-in-time network/pipe checks are blind to a
+# beacon injected into a legit process that sleeps with jitter on an internal C2.
+# The tell that needs neither the network nor a file on disk: private, committed,
+# executable memory (RWX or exec-writecopy) -- reflectively-loaded shellcode.
+# Native (no dependencies); heavy, so it runs on a slow cadence. If a memory
+# scanner is staged in <BaselineDir>\tools it gets a second opinion on hits.
+$script:MemApiReady = $null
+function Initialize-MemApi {
+    if ($null -ne $script:MemApiReady) { return $script:MemApiReady }
+    if ([IntPtr]::Size -ne 8) { $script:MemApiReady = $false; return $false }  # x64 layout only
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class BtdtMem {
+    [StructLayout(LayoutKind.Sequential)]
+    struct MBI { public IntPtr BaseAddress; public IntPtr AllocationBase; public uint AllocationProtect;
+                 public IntPtr RegionSize; public uint State; public uint Protect; public uint Type; }
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint a, bool inh, uint pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr VirtualQueryEx(IntPtr h, IntPtr addr, out MBI mbi, IntPtr len);
+    const uint MEM_COMMIT=0x1000, MEM_PRIVATE=0x20000, PAGE_GUARD=0x100;
+    public static List<string> Scan(uint pid, long minBytes) {
+        var outp = new List<string>();
+        IntPtr h = OpenProcess(0x0400, false, pid);   // PROCESS_QUERY_INFORMATION only -- VirtualQueryEx needs no VM_READ, so we never open lsass with read rights (avoids tripping AV/ASR)
+        if (h == IntPtr.Zero) return outp;
+        try {
+            IntPtr addr = IntPtr.Zero;
+            int sz = Marshal.SizeOf(typeof(MBI));
+            for (int i = 0; i < 200000; i++) {
+                MBI m;
+                if (VirtualQueryEx(h, addr, out m, (IntPtr)sz) == IntPtr.Zero) break;
+                long region = (long)m.RegionSize;
+                if (region <= 0) break;
+                uint p = m.Protect;
+                bool guard = (p & PAGE_GUARD) != 0;
+                uint pb = p & 0xFF;
+                bool execWrite = (pb == 0x40 /*RWX*/ || pb == 0x80 /*exec-writecopy*/);
+                if (!guard && (m.State & MEM_COMMIT) != 0 && (m.Type & MEM_PRIVATE) != 0 && execWrite && region >= minBytes)
+                    outp.Add(string.Format("0x{0:X}+{1}KB prot=0x{2:X}", (long)m.BaseAddress, region/1024, pb));
+                long next = (long)m.BaseAddress + region;
+                if (next <= (long)addr) break;
+                addr = (IntPtr)next;
+            }
+        } finally { CloseHandle(h); }
+        return outp;
+    }
+}
+'@
+        $script:MemApiReady = $true
+    } catch { $script:MemApiReady = $false }
+    return $script:MemApiReady
+}
+function Det-MemScan {
+    $everyN = if ($null -ne $MemScanCfg.EveryNSweeps) { [int]$MemScanCfg.EveryNSweeps } else { 10 }
+    if ($everyN -gt 0 -and (($script:SweepCount - 1) % $everyN) -ne 0) { return }  # runs on sweep 1, N+1, ...
+    if (-not (Initialize-MemApi)) { Info 'MemScan' 'native memory API unavailable (need 64-bit PowerShell) - skipped'; return }
+    $minKB = if ($MemScanCfg.MinRegionKB) { [int]$MemScanCfg.MinRegionKB } else { 12 }
+    $minBytes = 1024 * $minKB
+    $allow = @($MemScanCfg.AllowProc)
+    $scanner = @(Get-ChildItem (Join-Path $BaselineDir 'tools') -Filter '*.exe' -EA SilentlyContinue |
+                 Where-Object { $_.Name -match 'pe-?sieve|hollows' } | Select-Object -First 1 -Expand FullName)
+    foreach ($p in (Get-Process -EA SilentlyContinue)) {
+        if ($p.Id -le 4 -or $p.Id -eq $PID) { continue }
+        if ($allow -contains $p.Name) { continue }
+        $hits = try { [BtdtMem]::Scan([uint32]$p.Id, [int64]$minBytes) } catch { @() }
+        if (-not $hits -or $hits.Count -eq 0) { continue }
+        $path = try { $p.Path } catch { $null }
+        $sig  = Get-ProcSig $path
+        $regions = ($hits | Select-Object -First 4) -join ' '
+        $msg = "private executable (RWX) memory in $($p.Name) (pid=$($p.Id)) sig=$sig path=$path regions=[$regions]"
+        # Unsigned or drop-path host with injected RWX is about as good as this gets short of a full scan.
+        if ($sig -ne 'Valid' -or (Test-TempPath $path)) { Alert 'MemScan' 'high' $msg } else { Warn 'MemScan' $msg }
+        if ($scanner) {
+            try { $out = & $scanner /pid $p.Id /quiet 2>$null | Select-Object -Last 3
+                  if ($out) { Info 'MemScan' "second-opinion ($(Split-Path $scanner -Leaf)) pid $($p.Id): $(($out -join ' ').Trim())" } } catch {}
+        }
+    }
+}
+
+# #3 -------------------------------------------------------------------------
+# Blocked call-home in the Windows Firewall log. With default-deny outbound on,
+# every beacon check-in is logged as a dropped SEND instead of hoping the sweep
+# samples a live socket. Reads only bytes appended since the last sweep and only
+# surfaces drops to public IPs.
+$script:FwLogPos = $null
+function Det-FirewallLog {
+    if (-not (Test-Path $FirewallLog)) {
+        if ($null -eq $script:FwLogPos) { Info 'FirewallLog' "no firewall log at $FirewallLog - enable: Set-NetFirewallProfile -All -DefaultOutboundAction Block -LogBlocked True"; $script:FwLogPos = 0 }
+        return
+    }
+    try { $fs = [System.IO.File]::Open($FirewallLog, 'Open', 'Read', 'ReadWrite') } catch { return }
+    try {
+        $len = $fs.Length
+        if ($null -eq $script:FwLogPos) { $script:FwLogPos = $len; return }  # first sweep: skip history
+        if ($len -lt $script:FwLogPos) { $script:FwLogPos = 0 }              # log rotated/truncated
+        if ($len -eq $script:FwLogPos) { return }
+        [void]$fs.Seek($script:FwLogPos, 'Begin')
+        $reader = New-Object System.IO.StreamReader($fs)
+        $text = $reader.ReadToEnd()
+        $script:FwLogPos = $len
+    } finally { $fs.Close() }
+    foreach ($line in ($text -split "`n")) {
+        if ($line -notmatch ' DROP ') { continue }
+        $f = $line -split '\s+'
+        if ($f.Count -lt 8) { continue }
+        # W3C firewall fields: date time action protocol src-ip dst-ip src-port dst-port ...
+        $dst = $f[5]; $dport = $f[7]
+        if (Test-PublicIP $dst) {
+            Warn 'FirewallLog' "blocked outbound to public $dst`:$dport (firewall denied a call-home)"
         }
     }
 }
@@ -525,20 +767,24 @@ function Det-PrivGroups {
 # Sweep driver
 # --------------------------------------------------------------------------
 $Dispatch = [ordered]@{
-    NamedPipes   = { Det-NamedPipes }
-    Egress       = { Det-Egress }
-    LolbinEgress = { Det-LolbinEgress }
-    Listeners    = { Det-Listeners }
-    Persistence  = { Det-Persistence }
-    Firewall     = { Det-Firewall }
-    PortProxy    = { Det-PortProxy }
-    IISModules   = { Det-IISModules }
-    LogClear     = { Det-LogClear }
-    DnsTunnel    = { Det-DnsTunnel }
-    DCSync       = { Det-DCSync }
-    Kerberoast   = { Det-Kerberoast }
-    AsrepRoast   = { Det-AsrepRoast }
-    PrivGroups   = { Det-PrivGroups }
+    NamedPipes    = { Det-NamedPipes }
+    ProcCreate    = { Det-ProcCreate }
+    Egress        = { Det-Egress }
+    LolbinEgress  = { Det-LolbinEgress }
+    InternalBeacon= { Det-InternalBeacon }
+    MemScan       = { Det-MemScan }
+    Listeners     = { Det-Listeners }
+    Persistence   = { Det-Persistence }
+    Firewall      = { Det-Firewall }
+    FirewallLog   = { Det-FirewallLog }
+    PortProxy     = { Det-PortProxy }
+    IISModules    = { Det-IISModules }
+    LogClear      = { Det-LogClear }
+    DnsTunnel     = { Det-DnsTunnel }
+    DCSync        = { Det-DCSync }
+    Kerberoast    = { Det-Kerberoast }
+    AsrepRoast    = { Det-AsrepRoast }
+    PrivGroups    = { Det-PrivGroups }
 }
 
 function Invoke-Sweep {

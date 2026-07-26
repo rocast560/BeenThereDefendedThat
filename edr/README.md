@@ -80,15 +80,21 @@ mode, auto-response); `WARN` = worth a human look.
 | Check | Catches | Mechanism |
 |---|---|---|
 | `NamedPipes` | Cobalt Strike / Mythic | C2 pipe names (`msagent_*`, `postex_*`, `status_*`, `MSSE-*`, agent-UUID) — near-zero FP |
-| `Egress` | any beacon, IP-rotation-proof | outbound to a public IP from an **unsigned** or temp-path binary |
+| `ProcCreate` † | **beacon launch** (maldoc drop, stager) | Security **4688** + Sysmon **1**: office/script host spawning an interpreter, encoded PowerShell, or an unsigned image from a drop path |
+| `Egress` | any beacon, IP-rotation-proof | outbound to a **public** IP from an **unsigned** or temp-path binary |
 | `LolbinEgress` | scripted C2 | `powershell`/`rundll32`/`regsvr32`/`mshta`/`certutil`… holding an outbound socket |
+| `InternalBeacon` | **internal C2 / pivot / redirector** | a **suspicious** process (unsigned / temp-path / LOLBin) connecting to a non-trusted **internal** peer — closes the RFC1918 blind spot |
+| `MemScan` | **injected / sleeping in-memory beacon** | native scan for private+committed **RWX** memory not backed by a file (reflective shellcode) — no network needed; optional `pe-sieve`/`hollows_hunter` second opinion |
 | `Listeners` | bind shells / pivots | listening ports not in the allowlist |
 | `Persistence` | new backdoors since T0 | diff of scheduled tasks, Run keys, services, **WMI event subscriptions** |
-| `Firewall` | T1562.004 | a firewall profile disabled |
+| `Firewall` | T1562.004 | a firewall profile disabled, **or** outbound default-action flipped Block→Allow since T0 |
+| `FirewallLog` † | **blocked call-home** | dropped outbound (`SEND`) to a public IP in the Windows Firewall log — every denied beacon check-in, not just the ones a sweep samples |
 | `PortProxy` | pivot / piggyback | any `netsh interface portproxy` rule |
 | `IISModules` | memory-only web-shell | native IIS module loaded from outside the system dirs |
 | `LogClear` | anti-forensics | Security **1102** / System **104** (event log cleared) |
 | `DnsTunnel` | DNS C2 | long / high-entropy labels in the DNS client cache |
+
+**†** `ProcCreate` and `FirewallLog` are **event-driven** and only produce signal once you turn on the host telemetry that feeds them — see [Enabling the launch-time & egress telemetry](#enabling-the-launch-time--egress-telemetry) below. Every other check works out of the box. `ProcCreate`, `InternalBeacon`, `MemScan`, and `FirewallLog` **never auto-respond** — they only ever alert, whatever the mode, because a wrong kill/sever from a launch- or memory-heuristic is costlier than the WARN.
 
 ### Active Directory — Domain Controller (`btdt-edr.ps1`, auto-skips without the AD module)
 
@@ -107,6 +113,55 @@ the egress/firewall/DNS material from
 [`context/research/egress_bypass_edr_ccdc.md`](../context/research/egress_bypass_edr_ccdc.md),
 and the AD detections + the fail-open scoring rule from
 [`context/design/detection-tool-design.md`](../context/design/detection-tool-design.md).
+
+---
+
+## Enabling the launch-time & egress telemetry
+
+Most checks read state the OS always has. Three of the highest-impact ones —
+catching a beacon **as it launches**, catching an **injected/sleeping** beacon,
+and catching an **internal or blocked** call-home — are stronger when the host is
+generating the right telemetry first. All optional; the sensor degrades cleanly
+without them (the two event-driven checks just log "no data / skipped").
+
+**1. Process-creation logging (feeds `ProcCreate`).** The sweep is a poller and
+can never see the instant a process starts — the OS can. Enable, cheapest first:
+
+```powershell
+# Free, no install — Security 4688 with full command line + parent:
+auditpol /set /subcategory:"Process Creation" /success:enable
+# GPO: Administrative Templates > System > Audit Process Creation >
+#      "Include command line in process creation events" = Enabled
+#   (registry: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\
+#              Audit\ProcessCreationIncludeCmdLine_Enabled = 1)
+```
+Better still, deploy **Sysmon** (`sysmon64 -accepteula -i config.xml`, e.g. the
+SwiftOnSecurity/Olaf config) — `ProcCreate` reads Sysmon **EID 1** automatically,
+and Sysmon also adds image hashes, network (EID 3) and injection (EID 8/10) events.
+Optionally enable **PowerShell script-block logging** (EID 4104) to light up
+obfuscated launchers for near-zero cost.
+
+**2. Memory scanner second opinion (strengthens `MemScan`).** `MemScan` works
+natively with no dependencies. Drop `pe-sieve64.exe` or `hollows_hunter64.exe`
+into `C:\ProgramData\btdt-edr\tools\` and each flagged PID gets a deeper scan whose
+summary is logged alongside the native hit.
+
+**3. Default-deny outbound + logging (feeds `FirewallLog`).** Flip egress from
+"hope the sweep samples the socket" to "every blocked call-home is logged":
+
+```powershell
+Set-NetFirewallProfile -All -DefaultOutboundAction Block -LogBlocked True `
+  -LogFileName 'C:\Windows\System32\LogFiles\Firewall\pfirewall.log'
+# then add explicit allow rules for what this host legitimately needs outbound
+```
+Also list this host's legitimate internal peers in `TrustedInternalPeers` so
+`InternalBeacon` only fires on *unexpected* internal talkers.
+
+> **Testing on a live/production box?** Run `-Once -DryRun` (observe mode changes
+> nothing). Note `MemScan` walks every process's memory regions (read-only —
+> region metadata only, opened with `PROCESS_QUERY_INFORMATION`, never `VM_READ`,
+> so it never opens LSASS with read rights); a strict AV/EDR may still flag the
+> behavior, so `-Skip MemScan` for a first run if you don't want the noise.
 
 ---
 
@@ -193,21 +248,27 @@ The first run on each host **will** flag your own software — that is expected.
 Read the alerts, and for the legitimate ones edit the config:
 `ALLOWED_SNIFFERS`, `ALLOWED_JIT`, `ALLOWED_LISTEN_PORTS`, `LOLBIN_EGRESS`,
 `INTERNAL_RESOLVERS` (Linux) and `AllowedListenPorts`, `PrivilegedGroups`,
-`InternalResolvers` (Windows). Ten minutes of per-role tuning buys near-zero-FP
+`InternalResolvers`, `TrustedInternalPeers` (`InternalBeacon`), `MemScan.AllowProc`
+(JIT apps that legitimately hold RWX memory) (Windows). Ten minutes of per-role tuning buys near-zero-FP
 detection for the rest of the round. Toggle whole checks off with the
 `DET_*` / `Checks` switches or `--skip`.
 
 ## Limitations (know these going in)
 
-- **Snapshot polling, not kernel eventing.** A beacon that only lives between
-  sweeps can be missed; tighten `WATCH_INTERVAL` on critical hosts. For real-time
-  process/LSASS/injection telemetry, add **Sysmon** (one binary, no compile) — the
-  runbooks list the exact event IDs.
+- **Snapshot polling, not kernel eventing.** The socket/pipe/DNS checks sample
+  state and a beacon that only lives between sweeps can be missed; tighten
+  `WATCH_INTERVAL` on critical hosts. The Windows `ProcCreate` and `FirewallLog`
+  checks close part of this gap by reading OS **event** streams (4688 / Sysmon /
+  firewall-drop log) rather than polling — enable that telemetry (see above) and
+  the launch and blocked-call-home moments become event-driven.
 - **`/proc` and `bpftool` can be lied to** by a kernel rootkit. That is why the
   hidden-PID check corroborates `kill -0` with kernel taint and known module
   names — treat any single rootkit signal as "investigate," not gospel.
-- **In-memory beacons on Windows** (sleep-obfuscated Cobalt Strike/Havoc) need a
-  memory scanner (`pe-sieve`/`hollows_hunter`) that this kit does not bundle.
+- **In-memory beacons on Windows** (sleep-obfuscated Cobalt Strike/Havoc) are now
+  covered by `MemScan`'s native RWX-private scan, but that is a heuristic on a slow
+  cadence — for authoritative results drop `pe-sieve`/`hollows_hunter` in
+  `…\btdt-edr\tools\` (the kit uses it automatically) and don't rely on a single
+  scan against a beacon that is actively sleep-masking its memory.
 - **PowerShell 5.1** is assumed (Windows Server default). Smoke-test on a member
   server before the round; AD checks light up only on a DC / RSAT host.
 - This kit is deliberately **narrow**. For the broad misconfig/backdoor sweep,

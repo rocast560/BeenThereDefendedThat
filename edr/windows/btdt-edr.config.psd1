@@ -30,6 +30,57 @@
     InternalResolvers = @()          # e.g. @('10.0.0.53')
     InternalExtra     = @()          # extra CIDRs/prefixes to treat as internal
 
+    # ------------------------------------------------------------------
+    # #1 Launch-time process telemetry (ProcCreate)
+    # Reads Security 4688 AND Sysmon EID 1. To feed it, on the host enable:
+    #   auditpol /set /subcategory:"Process Creation" /success:enable
+    #   + GPO "Include command line in process creation events" (or deploy Sysmon).
+    # Fires only on beacon-drop patterns; never auto-kills (a bad kill on an
+    # interpreter is worse than a WARN).
+    # ------------------------------------------------------------------
+    ProcCreate = @{
+        # Office/script hosts that spawning an interpreter is a classic maldoc drop.
+        SuspectParents  = @('winword','excel','powerpnt','outlook','onenote',
+                            'mshta','wscript','cscript','acrord32','eqnedt32','hh')
+        # Interpreters/LOLBins a beacon stager launches.
+        SuspectChildren = @('powershell','pwsh','cmd','rundll32','regsvr32','mshta',
+                            'wscript','cscript','certutil','bitsadmin','installutil',
+                            'msbuild','wmic','cmstp','msiexec')
+        SuspectPaths    = 'Temp|AppData|ProgramData|\\Users\\Public|\\Downloads|\\Windows\\Tasks|\\PerfLogs'
+        MaxPerSweep     = 500     # cap XML parses per sweep on busy hosts
+    }
+
+    # ------------------------------------------------------------------
+    # #2 In-memory injection scan (MemScan)
+    # Native scan for private+committed executable memory (RWX / exec-writecopy)
+    # not backed by a file on disk -- the tell of reflectively-loaded shellcode,
+    # regardless of sleep/jitter or C2 address. Heavy: runs on a slow cadence.
+    # Optional: drop pe-sieve64.exe (or hollows_hunter64.exe) in
+    # <BaselineDir>\tools and flagged PIDs get a second-opinion scan.
+    # ------------------------------------------------------------------
+    MemScan = @{
+        EveryNSweeps = 10        # scan on sweep 1, then every Nth (0 = every sweep)
+        MinRegionKB  = 12        # ignore tiny RWX crumbs (hotpatch/trampolines)
+        # Heavy-JIT processes that legitimately hold RWX -- skip to stay quiet.
+        AllowProc    = @('powershell','pwsh','MsMpEng','SearchIndexer','devenv','code',
+                         'chrome','msedge','firefox','iexplore','java','javaw','jp2launcher',
+                         'w3wp','dotnet','Teams','ms-teams','OfficeClickToRun','SearchApp')
+    }
+
+    # ------------------------------------------------------------------
+    # #3 Egress hardening (InternalBeacon + FirewallLog)
+    # ------------------------------------------------------------------
+    # Internal peers this host legitimately talks to (exact IP or dotted prefix,
+    # e.g. '10.0.0.' for a subnet). A *suspicious* process (unsigned / temp-path /
+    # LOLBin) connecting to any OTHER internal peer is surfaced -- this is the fix
+    # for the RFC1918 blind spot where an internal C2/redirector is invisible.
+    TrustedInternalPeers = @()       # e.g. @('10.0.0.10','10.0.0.', '192.168.1.5')
+
+    # Windows Firewall dropped-packet log. Turn on default-deny outbound + logging:
+    #   Set-NetFirewallProfile -All -DefaultOutboundAction Block -LogBlocked True
+    # Then every blocked call-home is logged, not just sampled mid-call.
+    FirewallLog = 'C:\Windows\System32\LogFiles\Firewall\pfirewall.log'
+
     # Privileged AD groups whose membership is baselined and (in kill mode) reverted.
     PrivilegedGroups = @('Domain Admins', 'Enterprise Admins', 'Schema Admins',
                          'Administrators', 'Account Operators', 'Backup Operators')
@@ -42,11 +93,15 @@
     # Per-detection toggles
     Checks = @{
         NamedPipes    = $true    # Cobalt Strike / Mythic C2 named pipes
+        ProcCreate    = $true    # #1 beacon-drop process launches (4688 / Sysmon 1)
         Egress        = $true    # outbound by unsigned / temp-path binary
         LolbinEgress  = $true    # interpreter/LOLBin holding an outbound socket
+        InternalBeacon= $true    # #3 suspicious process -> non-trusted internal peer
+        MemScan       = $true    # #2 injected/RWX-private shellcode in memory
         Listeners     = $true    # unexpected listening ports
         Persistence   = $true    # tasks/services/Run keys/WMI diff vs T0
-        Firewall      = $true    # firewall profile disabled / tampered
+        Firewall      = $true    # firewall profile disabled / outbound un-blocked
+        FirewallLog   = $true    # #3 blocked outbound call-home in the firewall log
         PortProxy     = $true    # netsh portproxy piggyback
         IISModules    = $true    # malicious native IIS module (if IIS present)
         LogClear      = $true    # Security 1102 / System 104 (anti-forensics)
