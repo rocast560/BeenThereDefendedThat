@@ -71,6 +71,7 @@ $OnlyList     = if ($Only) { $Only -split '[,\s]+' } else { @() }
 $SkipList     = if ($Skip) { $Skip -split '[,\s]+' } else { @() }
 $ProcCreateCfg= if ($Cfg.ProcCreate) { $Cfg.ProcCreate } else { @{} }
 $MemScanCfg   = if ($Cfg.MemScan) { $Cfg.MemScan } else { @{} }
+$NetConnectCfg= if ($Cfg.NetConnect) { $Cfg.NetConnect } else { @{} }
 $TrustedPeers = @($Cfg.TrustedInternalPeers)
 $FirewallLog  = if ($Cfg.FirewallLog) { $Cfg.FirewallLog } else { 'C:\Windows\System32\LogFiles\Firewall\pfirewall.log' }
 
@@ -449,6 +450,65 @@ function Det-LolbinEgress {
     }
 }
 
+# #3 Event-driven egress via Sysmon EID 3. Egress/InternalBeacon poll live sockets
+# and miss a brief, periodic beacon check-in (a sub-second mtls/https connection
+# every 12-35s is almost never alive when the 30s sweep looks). Sysmon logs every
+# connection as an EVENT, so this catches the check-in the moment it happens --
+# the reliable answer to the polling blind spot. Detection-only: the event is
+# historical, so it alerts rather than acting on a possibly-recycled pid (the live
+# Egress check remains the auto-responder). Alerts once per unique image+dest/run.
+$script:NetSeen = @{}
+function Det-NetworkConnect {
+    $log = 'Microsoft-Windows-Sysmon/Operational'
+    $events = @(Get-EventsSafe $log 3 $LookbackMin)
+    if (-not $events.Count) {
+        if (-not $script:NetConnNoted) {
+            $script:NetConnNoted = $true
+            if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) {
+                Info 'NetworkConnect' 'no Sysmon operational log - install Sysmon with network logging (EID 3) to catch brief/periodic beacon check-ins'
+            }
+        }
+        return
+    }
+    $cap = if ($NetConnectCfg.MaxPerSweep) { [int]$NetConnectCfg.MaxPerSweep } else { 1000 }
+    $sigCache = @{}
+    $n = 0
+    foreach ($e in $events) {
+        if ($n -ge $cap) { break }; $n++
+        try { $x = [xml]$e.ToXml() } catch { continue }
+        $data = $x.Event.EventData.Data
+        if ((Get-EventField $data @('Initiated')) -ne 'true') { continue }   # outbound only
+        $img    = Get-EventField $data @('Image')
+        $dip    = Get-EventField $data @('DestinationIp')
+        $dport  = Get-EventField $data @('DestinationPort')
+        $procId = Get-EventField $data @('ProcessId')
+        if (-not $img -or -not $dip) { continue }
+        if ($dip -match '^(127\.|::1$|0\.0\.0\.0$|::$|fe80:|169\.254\.)') { continue }
+
+        $name = ((Split-Path $img -Leaf) -replace '\.exe$','').ToLower()
+        if (-not $sigCache.ContainsKey($img)) { $sigCache[$img] = Get-ProcSig $img }
+        $sig = $sigCache[$img]
+        $tempish = Test-TempPath $img
+        $lol = $Lolbins -contains $name
+        if ($sig -eq 'Valid' -and -not $tempish -and -not $lol) { continue }  # signed, normal path, not a LOLBin
+
+        $public = Test-PublicIP $dip
+        if (-not $public) {
+            $trusted = $false
+            foreach ($t in $TrustedPeers) { if ($t -and $dip.StartsWith($t)) { $trusted = $true; break } }
+            if ($trusted) { continue }
+        }
+        $key = "$img|$dip|$dport"
+        if ($script:NetSeen.ContainsKey($key)) { continue }   # one alert per unique C2 dest per run
+        $script:NetSeen[$key] = $true
+
+        $why = @(); if ($sig -ne 'Valid') { $why += "sig=$sig" }; if ($tempish) { $why += 'temp-path' }; if ($lol) { $why += 'lolbin' }
+        $scope = if ($public) { 'public' } else { 'internal' }
+        $msg = "outbound connection (Sysmon EID3) to $scope $dip`:$dport from $name (pid=$procId) [$(($why) -join ',')] image=$img"
+        if ($public) { Alert 'NetworkConnect' 'high' $msg } else { Warn 'NetworkConnect' $msg }
+    }
+}
+
 function Det-Listeners {
     try { $ls = Get-NetTCPConnection -State Listen -ErrorAction Stop } catch { return }
     foreach ($l in ($ls | Sort-Object LocalPort -Unique)) {
@@ -772,6 +832,7 @@ $Dispatch = [ordered]@{
     Egress        = { Det-Egress }
     LolbinEgress  = { Det-LolbinEgress }
     InternalBeacon= { Det-InternalBeacon }
+    NetworkConnect= { Det-NetworkConnect }
     MemScan       = { Det-MemScan }
     Listeners     = { Det-Listeners }
     Persistence   = { Det-Persistence }

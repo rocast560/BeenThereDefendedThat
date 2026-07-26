@@ -84,6 +84,7 @@ mode, auto-response); `WARN` = worth a human look.
 | `Egress` | any beacon, IP-rotation-proof | outbound to a **public** IP from an **unsigned** or temp-path binary |
 | `LolbinEgress` | scripted C2 | `powershell`/`rundll32`/`regsvr32`/`mshta`/`certutil`… holding an outbound socket |
 | `InternalBeacon` | **internal C2 / pivot / redirector** | a **suspicious** process (unsigned / temp-path / LOLBin) connecting to a non-trusted **internal** peer — closes the RFC1918 blind spot |
+| `NetworkConnect` † | **brief / periodic beacons** (mtls/https check-ins) | Sysmon **EID 3** connection *events* from a suspicious image — catches a sub-second check-in the socket poll never sees; the fix for the polling blind spot |
 | `MemScan` | **injected / sleeping in-memory beacon** | native scan for private+committed **RWX** memory not backed by a file (reflective shellcode) — no network needed; optional `pe-sieve`/`hollows_hunter` second opinion |
 | `Listeners` | bind shells / pivots | listening ports not in the allowlist |
 | `Persistence` | new backdoors since T0 | diff of scheduled tasks, Run keys, services, **WMI event subscriptions** |
@@ -94,7 +95,7 @@ mode, auto-response); `WARN` = worth a human look.
 | `LogClear` | anti-forensics | Security **1102** / System **104** (event log cleared) |
 | `DnsTunnel` | DNS C2 | long / high-entropy labels in the DNS client cache |
 
-**†** `ProcCreate` and `FirewallLog` are **event-driven** and only produce signal once you turn on the host telemetry that feeds them — see [Enabling the launch-time & egress telemetry](#enabling-the-launch-time--egress-telemetry) below. Every other check works out of the box. `ProcCreate`, `InternalBeacon`, `MemScan`, and `FirewallLog` **never auto-respond** — they only ever alert, whatever the mode, because a wrong kill/sever from a launch- or memory-heuristic is costlier than the WARN.
+**†** `ProcCreate`, `NetworkConnect`, and `FirewallLog` are **event-driven** and only produce signal once you turn on the host telemetry that feeds them — see [Enabling the launch-time & egress telemetry](#enabling-the-launch-time--egress-telemetry) below. Every other check works out of the box. `ProcCreate`, `InternalBeacon`, `NetworkConnect`, `MemScan`, and `FirewallLog` **never auto-respond** — they only ever alert, whatever the mode, because a wrong kill/sever from a launch-, event-, or memory-heuristic is costlier than the WARN (the live `Egress` check remains the auto-responder for public C2).
 
 ### Active Directory — Domain Controller (`btdt-edr.ps1`, auto-skips without the AD module)
 
@@ -137,9 +138,14 @@ auditpol /set /subcategory:"Process Creation" /success:enable
 ```
 Better still, deploy **Sysmon** (`sysmon64 -accepteula -i config.xml`, e.g. the
 SwiftOnSecurity/Olaf config) — `ProcCreate` reads Sysmon **EID 1** automatically,
-and Sysmon also adds image hashes, network (EID 3) and injection (EID 8/10) events.
-Optionally enable **PowerShell script-block logging** (EID 4104) to light up
-obfuscated launchers for near-zero cost.
+and Sysmon also adds image hashes and injection (EID 8/10) events. **Make sure the
+config logs network events (EID 3)** — that feeds `NetworkConnect`, which is the
+*only* check that reliably catches a brief, periodic beacon (a sub-second mtls/https
+check-in every 12–35s is almost never alive when the socket poll looks, but Sysmon
+logs it as an event). The SwiftOnSecurity config logs EID 3 for the risky images by
+default; if yours filters it out, un-filter network logging. Optionally enable
+**PowerShell script-block logging** (EID 4104) to light up obfuscated launchers for
+near-zero cost.
 
 **2. Memory scanner second opinion (strengthens `MemScan`).** `MemScan` works
 natively with no dependencies. Drop `pe-sieve64.exe` or `hollows_hunter64.exe`

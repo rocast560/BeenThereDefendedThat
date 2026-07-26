@@ -81,6 +81,13 @@
     # Then every blocked call-home is logged, not just sampled mid-call.
     FirewallLog = 'C:\Windows\System32\LogFiles\Firewall\pfirewall.log'
 
+    # NetworkConnect: read Sysmon EID 3 (network-connect) EVENTS instead of polling
+    # live sockets, so a brief, periodic beacon check-in is caught the moment it
+    # happens -- the point-in-time poll behind Egress/InternalBeacon misses a
+    # sub-second mtls/https check-in almost every sweep. Needs Sysmon with network
+    # logging on. Alerts once per unique image+destination per run to stay quiet.
+    NetConnect = @{ MaxPerSweep = 1000 }
+
     # Privileged AD groups whose membership is baselined and (in kill mode) reverted.
     PrivilegedGroups = @('Domain Admins', 'Enterprise Admins', 'Schema Admins',
                          'Administrators', 'Account Operators', 'Backup Operators')
@@ -97,6 +104,7 @@
         Egress        = $true    # outbound by unsigned / temp-path binary
         LolbinEgress  = $true    # interpreter/LOLBin holding an outbound socket
         InternalBeacon= $true    # #3 suspicious process -> non-trusted internal peer
+        NetworkConnect= $true    # #3 event-driven egress (Sysmon EID 3) - catches brief beacons
         MemScan       = $true    # #2 injected/RWX-private shellcode in memory
         Listeners     = $true    # unexpected listening ports
         Persistence   = $true    # tasks/services/Run keys/WMI diff vs T0
