@@ -18,7 +18,18 @@
     .\btdt-edr.ps1 -Watch              # loop forever every WatchInterval seconds
     .\btdt-edr.ps1 -Watch -Respond kill   # loop + auto-contain high-confidence hits
 
-  Exit code: 0 = clean sweep, 1 = at least one ALERT this sweep.
+  Controlling a running -Watch loop (handy while developing/tuning, since the
+  loop may be in another window or launched by a task):
+
+    .\btdt-edr.ps1 -Status             # is a watch loop running, and as what pid
+    .\btdt-edr.ps1 -Stop               # ask it to stop, force-kill if it won't
+    .\btdt-edr.ps1 -Watch -Force       # stop whatever is running, then start fresh
+
+  -Watch records its pid under BaselineDir and refuses to start a second loop
+  unless -Force is given, so two responders can never fight over the same host.
+
+  Exit codes: 0 = clean sweep (or -Stop/-Status ok), 1 = at least one ALERT this
+  sweep, 2 = refused to start because a watch loop is already running.
 #>
 [CmdletBinding()]
 param(
@@ -30,6 +41,9 @@ param(
     [switch]$Baseline,
     [switch]$Once,
     [switch]$Watch,
+    [switch]$Stop,
+    [switch]$Status,
+    [switch]$Force,
     [switch]$NoColor,
     [switch]$DryRun
 )
@@ -56,9 +70,10 @@ $Checks       = if ($Cfg.Checks) { $Cfg.Checks } else { @{} }
 $OnlyList     = if ($Only) { $Only -split '[,\s]+' } else { @() }
 $SkipList     = if ($Skip) { $Skip -split '[,\s]+' } else { @() }
 
-if (-not $Baseline -and -not $Watch) { $Once = $true }
+if (-not $Baseline -and -not $Watch -and -not $Stop -and -not $Status) { $Once = $true }
 
 $script:AlertCount = 0
+$script:SweepCount = 0
 $script:LogEnabled = $false
 $script:SeenEvents = @{}   # RecordIds already alerted, so -Watch doesn't re-fire
 try { New-Item -ItemType Directory -Force -Path $BaselineDir -ErrorAction Stop | Out-Null
@@ -88,6 +103,102 @@ function Emit($level, $check, $conf, $msg) {
 function Alert($check, $conf, $msg) { Emit 'ALERT' $check $conf $msg }
 function Warn($check, $msg)         { Emit 'WARN'  $check 'med' $msg }
 function Info($check, $msg)         { Emit 'INFO'  $check 'low' $msg }
+
+# --------------------------------------------------------------------------
+# Instance control
+#
+# -Watch drops a pid file so a second shell can find and stop the loop without
+# hunting for it in Task Manager. Stopping is two-stage: touch a stop file the
+# loop polls (so it unwinds cleanly and removes its own pid file), then force
+# -kill if it hasn't gone in StopGraceSec. Both files live in BaselineDir, so
+# if that isn't writable (unelevated) -Stop degrades to the command-line scan.
+# --------------------------------------------------------------------------
+$PidFile      = Join-Path $BaselineDir 'btdt-edr.pid'
+$StopFile     = Join-Path $BaselineDir 'btdt-edr.stop'
+$StopGraceSec = 15
+
+function Write-PidFile {
+    try {
+        $me = Get-Process -Id $PID -ErrorAction Stop
+        # Store StartTime too: a pid alone is reusable, and killing a recycled
+        # pid would take out an unrelated process.
+        $o = [ordered]@{ pid=$PID; start=$me.StartTime.ToString('o'); since=(Now-Ts); respond=$RespondMode }
+        Set-Content -Path $PidFile -Value ($o | ConvertTo-Json -Compress) -ErrorAction Stop
+    } catch { Warn 'instance' "could not write pid file, -Stop will fall back to a process scan: $_" }
+}
+function Clear-PidFile  { Remove-Item $PidFile  -Force -ErrorAction SilentlyContinue }
+function Clear-StopFile { Remove-Item $StopFile -Force -ErrorAction SilentlyContinue }
+function Test-StopRequested { return ($Watch -and (Test-Path $StopFile)) }
+
+# Live process recorded in the pid file, or $null. Stale files are cleaned up.
+function Get-RunningInstance {
+    if (-not (Test-Path $PidFile)) { return $null }
+    try { $rec = Get-Content $PidFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { Clear-PidFile; return $null }
+    if (-not $rec.pid -or $rec.pid -eq $PID) { return $null }
+    $p = Get-Process -Id $rec.pid -ErrorAction SilentlyContinue
+    if (-not $p) { Clear-PidFile; return $null }
+    if ($rec.start) {
+        $same = try { $p.StartTime.ToString('o') -eq $rec.start } catch { $false }
+        if (-not $same) { Clear-PidFile; return $null }   # pid was recycled
+    }
+    return $p
+}
+
+# Fallback for a lost pid file: any other PowerShell running this script.
+function Find-OrphanInstances {
+    try {
+        @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction Stop |
+            Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match 'btdt-edr\.ps1' -and
+                           $_.CommandLine -notmatch '-Stop|-Status' })
+    } catch { @() }
+}
+
+function Stop-Instance {
+    $p = Get-RunningInstance
+    if (-not $p) {
+        $orphans = Find-OrphanInstances
+        if (-not $orphans.Count) { Info 'instance' 'no running instance found'; Clear-StopFile; return $false }
+        foreach ($o in $orphans) {
+            Warn 'instance' "no pid file, but pid $($o.ProcessId) is running this script - killing"
+            try { Stop-Process -Id $o.ProcessId -Force -ErrorAction Stop } catch { Warn 'instance' "kill failed: $_" }
+        }
+        Clear-StopFile; Clear-PidFile
+        return $true
+    }
+    Info 'instance' "stop requested for pid $($p.Id), waiting up to ${StopGraceSec}s for it to unwind"
+    try { Set-Content -Path $StopFile -Value (Now-Ts) -ErrorAction Stop }
+    catch { Warn 'instance' "could not write stop file, going straight to force-kill: $_" }
+    $exited = try { $p.WaitForExit($StopGraceSec * 1000) } catch { $false }
+    if (-not $exited) {
+        Warn 'instance' "pid $($p.Id) did not stop in ${StopGraceSec}s - forcing"
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { Warn 'instance' "force-kill failed: $_" }
+    }
+    Clear-StopFile; Clear-PidFile
+    Emit 'OK' 'instance' 'low' "stopped pid $($p.Id)"
+    return $true
+}
+
+function Show-Status {
+    $p = Get-RunningInstance
+    if ($p) {
+        Emit 'OK' 'instance' 'low' "watch loop running: pid $($p.Id), started $($p.StartTime.ToString('u'))"
+        return
+    }
+    $orphans = Find-OrphanInstances
+    if ($orphans.Count) {
+        Warn 'instance' "no pid file, but these look like this script: $(($orphans.ProcessId) -join ', ')"
+    } else {
+        Info 'instance' 'no watch loop running'
+    }
+}
+
+# Sleep in 1s slices so -Stop lands inside a second instead of a whole interval.
+function Wait-Interval($seconds) {
+    for ($i = 0; $i -lt $seconds; $i++) {
+        if (Test-Path $StopFile) { return }
+        Start-Sleep -Seconds 1
+    }
+}
 
 function Test-Enabled($name) {
     if ($Checks.Contains($name) -and (-not $Checks[$name])) { return $false }
@@ -432,7 +543,11 @@ $Dispatch = [ordered]@{
 
 function Invoke-Sweep {
     $script:AlertCount = 0
+    $script:SweepCount++
     foreach ($name in $Dispatch.Keys) {
+        # Checked per-check, not just per-sweep, so -Stop doesn't have to wait
+        # out a full sweep on a slow box.
+        if (Test-StopRequested) { return }
         if (Test-Enabled $name) {
             try { & $Dispatch[$name] } catch { Warn $name "check errored: $_" }
         }
@@ -442,6 +557,12 @@ function Invoke-Sweep {
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+
+# Control verbs first: they don't sweep, so skip the AD import and the
+# elevation warning entirely and stay fast.
+if ($Status) { Show-Status; exit 0 }
+if ($Stop)   { Stop-Instance | Out-Null; exit 0 }
+
 $script:HasAD = $false
 try { Import-Module ActiveDirectory -ErrorAction Stop; $script:HasAD = $true } catch { }
 
@@ -453,12 +574,35 @@ Info 'init' "btdt-edr | mode=$(if($Watch){'watch'}else{'once'}) respond=$Respond
 if ($Baseline) { Invoke-Baseline; if (-not $Watch -and -not $Once) { exit 0 } }
 
 if ($Watch) {
-    while ($true) {
-        Invoke-Sweep
-        if ($script:AlertCount -gt 0) { Emit 'WARN' 'sweep' 'low' "sweep complete: $($script:AlertCount) alert(s)" }
-        else { Emit 'OK' 'sweep' 'low' 'sweep complete: clean' }
-        Start-Sleep -Seconds $WatchInterval
+    $existing = Get-RunningInstance
+    if ($existing) {
+        if ($Force) {
+            Info 'instance' "-Force: replacing watch loop at pid $($existing.Id)"
+            Stop-Instance | Out-Null
+        } else {
+            Warn 'instance' "already watching as pid $($existing.Id) - use -Stop, or -Watch -Force to replace it"
+            exit 2
+        }
     }
+    Clear-StopFile            # don't let a leftover stop file kill a fresh loop
+    Write-PidFile
+    Info 'instance' "watch loop is pid $PID - stop it with: .\btdt-edr.ps1 -Stop"
+    try {
+        while (-not (Test-Path $StopFile)) {
+            Invoke-Sweep
+            if (Test-Path $StopFile) { break }
+            if ($script:AlertCount -gt 0) { Emit 'WARN' 'sweep' 'low' "sweep complete: $($script:AlertCount) alert(s)" }
+            else { Emit 'OK' 'sweep' 'low' 'sweep complete: clean' }
+            Wait-Interval $WatchInterval
+        }
+        Info 'instance' "stopping on request after $($script:SweepCount) sweep(s)"
+    } finally {
+        # Also runs on Ctrl+C, so an interactively-killed loop doesn't leave a
+        # pid file behind that blocks the next -Watch.
+        Clear-PidFile
+        Clear-StopFile
+    }
+    exit 0
 } else {
     Invoke-Sweep
     if ($script:AlertCount -gt 0) { Write-Host "Summary: $($script:AlertCount) ALERT" -ForegroundColor Red; exit 1 }
