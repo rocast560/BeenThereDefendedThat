@@ -1,13 +1,13 @@
 <#
-  btdt-edr.ps1 — BeenThereDefendedThat lightweight host-local EDR sensor (Windows/AD)
+  btdt-edr.ps1 - BeenThereDefendedThat lightweight host-local EDR sensor (Windows/AD)
 
   A single-file, dependency-light detect-and-respond sensor for CCDC-style
   competitions where every box is assumed pre-compromised and there is no safe
   central host to run a control plane on. Copy this script + btdt-edr.config.psd1
   to a box (member server or Domain Controller), run elevated, and it hunts the
-  mechanisms an implant cannot avoid — C2 named pipes, outbound calls from
+  mechanisms an implant cannot avoid - C2 named pipes, outbound calls from
   unsigned/temp-path binaries, replication-rights abuse (DCSync), persistence,
-  firewall tamper — rather than signatures it can change.
+  firewall tamper - rather than signatures it can change.
 
   It is the continuous sensor/responder companion to the point-in-time auditor
   Competition-Playbook/ccdc-audit/ad-audit.ps1: run that once at T0 for the full 40+ check
@@ -120,7 +120,7 @@ function Get-Entropy([string]$s) {
 function Get-EventsSafe($log, $id, $minutes) {
     $start = (Get-Date).AddMinutes(-1 * $minutes)
     try { $evs = @(Get-WinEvent -FilterHashtable @{ LogName=$log; Id=$id; StartTime=$start } -ErrorAction Stop) }
-    catch { return @() }   # "No events were found" throws — treat as empty
+    catch { return @() }   # "No events were found" throws - treat as empty
     # Return only events not already alerted, so -Watch fires once per event.
     $fresh = @()
     foreach ($e in $evs) {
@@ -131,7 +131,7 @@ function Get-EventsSafe($log, $id, $minutes) {
 }
 
 # --------------------------------------------------------------------------
-# Response layer — gated by RespondMode + confidence. Fail-open on scored ports.
+# Response layer - gated by RespondMode + confidence. Fail-open on scored ports.
 # --------------------------------------------------------------------------
 function Should-Respond($conf, $need) {
     if ($conf -ne 'high') { return $false }
@@ -144,7 +144,7 @@ function Invoke-Act([string]$desc, [scriptblock]$sb) {
     if ($DryRun) { return }
     try { & $sb | Out-Null } catch { Warn 'respond' "action failed: $desc :: $_" }
 }
-# Confirmation that an action actually ran — silent in dry-run so we never claim
+# Confirmation that an action actually ran - silent in dry-run so we never claim
 # to have contained something we only simulated.
 function Contained($msg) { if (-not $DryRun) { Emit 'WARN' 'respond' 'high' $msg } }
 function Resp-Kill($procId, $name) {
@@ -289,7 +289,7 @@ function Det-Listeners {
 
 function Det-Persistence {
     $pdir = Join-Path $BaselineDir 'persist'
-    if (-not (Test-Path $pdir)) { Info 'Persistence' 'no baseline yet — run -Baseline at T0'; return }
+    if (-not (Test-Path $pdir)) { Info 'Persistence' 'no baseline yet - run -Baseline at T0'; return }
     $snap = Get-PersistSnapshot
     foreach ($cat in $snap.Keys) {
         $bf = Join-Path $pdir "$cat.txt"
@@ -350,7 +350,7 @@ function Det-DnsTunnel {
 
 # ---- Active Directory (Domain Controller) -----------------------------------
 function Det-DCSync {
-    if (-not $script:HasAD) { Info 'DCSync' 'no AD module — skipped'; return }
+    if (-not $script:HasAD) { Info 'DCSync' 'no AD module - skipped'; return }
     foreach ($e in (Get-EventsSafe 'Security' 4662 $LookbackMin)) {
         try { $x = [xml]$e.ToXml() } catch { continue }
         $data = $x.Event.EventData.Data
@@ -373,7 +373,7 @@ function Det-Kerberoast {
         $svc = ($data | Where-Object { $_.Name -eq 'ServiceName' }).'#text'
         $usr = ($data | Where-Object { $_.Name -eq 'TargetUserName' }).'#text'
         if ($enc -eq '0x17' -and $svc -ne 'krbtgt' -and $svc -notmatch '\$$') {
-            Warn 'Kerberoast' "RC4 (0x17) service ticket requested for SPN '$svc' by '$usr' — possible Kerberoasting"
+            Warn 'Kerberoast' "RC4 (0x17) service ticket requested for SPN '$svc' by '$usr' - possible Kerberoasting"
         }
     }
 }
@@ -385,7 +385,7 @@ function Det-AsrepRoast {
         $data = $x.Event.EventData.Data
         $pre = ($data | Where-Object { $_.Name -eq 'PreAuthType' }).'#text'
         $usr = ($data | Where-Object { $_.Name -eq 'TargetUserName' }).'#text'
-        if ($pre -eq '0') { Warn 'AsrepRoast' "AS-REQ without pre-authentication for '$usr' — possible AS-REP roasting" }
+        if ($pre -eq '0') { Warn 'AsrepRoast' "AS-REQ without pre-authentication for '$usr' - possible AS-REP roasting" }
     }
     try {
         Get-ADUser -Filter 'useraccountcontrol -band 4194304' -Properties useraccountcontrol -EA Stop |
@@ -394,12 +394,12 @@ function Det-AsrepRoast {
 }
 
 function Det-PrivGroups {
-    if (-not $script:HasAD) { Info 'PrivGroups' 'no AD module — skipped'; return }
+    if (-not $script:HasAD) { Info 'PrivGroups' 'no AD module - skipped'; return }
     $gdir = Join-Path $BaselineDir 'privgroups'
     foreach ($g in $PrivGroups) {
         $bf = Join-Path $gdir ("{0}.txt" -f ($g -replace '\s','_'))
         $cur = try { @(Get-ADGroupMember -Identity $g -Recursive -EA Stop | Select-Object -Expand SamAccountName) } catch { continue }
-        if (-not (Test-Path $bf)) { Info 'PrivGroups' "no baseline for '$g' — run -Baseline at T0"; continue }
+        if (-not (Test-Path $bf)) { Info 'PrivGroups' "no baseline for '$g' - run -Baseline at T0"; continue }
         $base = @(Get-Content $bf)
         Compare-Object -ReferenceObject $base -DifferenceObject $cur |
             Where-Object { $_.SideIndicator -eq '=>' } |
@@ -447,7 +447,7 @@ try { Import-Module ActiveDirectory -ErrorAction Stop; $script:HasAD = $true } c
 
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-if (-not $admin) { Warn 'init' 'not elevated — event-log, socket-owner and firewall checks will be degraded' }
+if (-not $admin) { Warn 'init' 'not elevated - event-log, socket-owner and firewall checks will be degraded' }
 Info 'init' "btdt-edr | mode=$(if($Watch){'watch'}else{'once'}) respond=$RespondMode ad=$($script:HasAD) dry-run=$([bool]$DryRun)"
 
 if ($Baseline) { Invoke-Baseline; if (-not $Watch -and -not $Once) { exit 0 } }

@@ -1,5 +1,5 @@
 @{
-    # btdt-edr.config.psd1 — Windows/AD sensor configuration.
+    # btdt-edr.config.psd1 - Windows/AD sensor configuration.
     # Loaded with Import-PowerShellDataFile. Everything here is an allowlist or a
     # toggle. The first run on a host is meant to be noisy: read the ALERTs,
     # decide which are your own software, add them here, re-run.
