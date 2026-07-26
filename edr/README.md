@@ -86,6 +86,7 @@ mode, auto-response); `WARN` = worth a human look.
 | `InternalBeacon` | **internal C2 / pivot / redirector** | a **suspicious** process (unsigned / temp-path / LOLBin) connecting to a non-trusted **internal** peer — closes the RFC1918 blind spot |
 | `NetworkConnect` † | **brief / periodic beacons** (mtls/https check-ins) | Sysmon **EID 3** connection *events* from a suspicious image — catches a sub-second check-in the socket poll never sees; the fix for the polling blind spot |
 | `MemScan` | **injected / sleeping in-memory beacon** | native scan for private+committed **RWX** memory not backed by a file (reflective shellcode) — no network needed; optional `pe-sieve`/`hollows_hunter` second opinion |
+| `RawSocket` | **passive sniff-shell** (watershell-style) | a **WinDivert / pcap** driver, or a NIC in **promiscuous** mode — the mechanism a socket-less, listener-less sniffer can't hide from the firewall or connection-layer checks (Windows analog of Linux `rawsock`) |
 | `Listeners` | bind shells / pivots | listening ports not in the allowlist |
 | `Persistence` | new backdoors since T0 | diff of scheduled tasks, Run keys, services, **WMI event subscriptions** |
 | `Firewall` | T1562.004 | a firewall profile disabled, **or** outbound default-action flipped Block→Allow since T0 |
@@ -95,7 +96,7 @@ mode, auto-response); `WARN` = worth a human look.
 | `LogClear` | anti-forensics | Security **1102** / System **104** (event log cleared) |
 | `DnsTunnel` | DNS C2 | long / high-entropy labels in the DNS client cache |
 
-**†** `ProcCreate`, `NetworkConnect`, and `FirewallLog` are **event-driven** and only produce signal once you turn on the host telemetry that feeds them — see [Enabling the launch-time & egress telemetry](#enabling-the-launch-time--egress-telemetry) below. Every other check works out of the box. `ProcCreate`, `InternalBeacon`, `NetworkConnect`, `MemScan`, and `FirewallLog` **never auto-respond** — they only ever alert, whatever the mode, because a wrong kill/sever from a launch-, event-, or memory-heuristic is costlier than the WARN (the live `Egress` check remains the auto-responder for public C2).
+**†** `ProcCreate`, `NetworkConnect`, and `FirewallLog` are **event-driven** and only produce signal once you turn on the host telemetry that feeds them — see [Enabling the launch-time & egress telemetry](#enabling-the-launch-time--egress-telemetry) below. Every other check works out of the box (`RawSocket`'s driver/promiscuous scans are native; only its optional Sysmon EID 6 tier needs telemetry). `ProcCreate`, `InternalBeacon`, `NetworkConnect`, `MemScan`, `RawSocket`, and `FirewallLog` **never auto-respond** — they only ever alert, whatever the mode, because a wrong kill/sever from a launch-, event-, memory-, or driver-heuristic is costlier than the WARN (the live `Egress` check remains the auto-responder for public C2).
 
 ### Active Directory — Domain Controller (`btdt-edr.ps1`, auto-skips without the AD module)
 

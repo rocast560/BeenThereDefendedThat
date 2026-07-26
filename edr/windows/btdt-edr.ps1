@@ -72,6 +72,7 @@ $SkipList     = if ($Skip) { $Skip -split '[,\s]+' } else { @() }
 $ProcCreateCfg= if ($Cfg.ProcCreate) { $Cfg.ProcCreate } else { @{} }
 $MemScanCfg   = if ($Cfg.MemScan) { $Cfg.MemScan } else { @{} }
 $NetConnectCfg= if ($Cfg.NetConnect) { $Cfg.NetConnect } else { @{} }
+$RawSocketCfg = if ($Cfg.RawSocket) { $Cfg.RawSocket } else { @{} }
 $TrustedPeers = @($Cfg.TrustedInternalPeers)
 $FirewallLog  = if ($Cfg.FirewallLog) { $Cfg.FirewallLog } else { 'C:\Windows\System32\LogFiles\Firewall\pfirewall.log' }
 
@@ -727,6 +728,57 @@ function Det-MemScan {
     }
 }
 
+# #1 -------------------------------------------------------------------------
+# Raw-socket / sniff-shell detection -- the Windows analog of the Linux rawsock
+# check. A passive sniff-shell (watershell-style) opens no socket and no
+# listener; it reads packets in promiscuous mode or via a packet-interception
+# driver, so the firewall and every connection-layer check are blind to it. This
+# hunts the mechanism it cannot hide: a WinDivert/pcap driver, or a NIC forced
+# into promiscuous mode. Detection-only.
+function Det-RawSocket {
+    $allowDrv = @($RawSocketCfg.AllowCaptureDrivers) | ForEach-Object { "$_".ToLower() }
+    $allowNic = @($RawSocketCfg.AllowPromiscAdapters)
+
+    # 1. Packet capture / interception drivers present. WinDivert is a strong C2 /
+    #    port-piggyback signal; pcap drivers are legit for Wireshark but worth a look.
+    try {
+        foreach ($d in (Get-CimInstance Win32_SystemDriver -ErrorAction Stop |
+                        Where-Object { $_.Name -match '(?i)windivert|npcap|npf|winpcap|pcap' -or
+                                       $_.DisplayName -match '(?i)windivert|npcap|winpcap|pcap' })) {
+            $nm = "$($d.Name)".ToLower()
+            if ($allowDrv -contains $nm) { continue }
+            if ($nm -match 'windivert') {
+                Alert 'RawSocket' 'high' "WinDivert packet-interception driver present (state=$($d.State)) - sniff-shell / port-piggyback C2 mechanism: $($d.PathName)"
+            } elseif ($d.State -eq 'Running') {
+                Warn 'RawSocket' "packet-capture driver running '$($d.Name)' ($($d.DisplayName)) - legit for Wireshark/Npcap; confirm it is yours"
+            }
+        }
+    } catch {}
+
+    # 2. NIC(s) in promiscuous mode -- a raw-socket sniffer (SIO_RCVALL) or a
+    #    capture tool. 0x20 = NDIS_PACKET_TYPE_PROMISCUOUS in the NDIS packet filter.
+    try {
+        foreach ($f in (Get-CimInstance -Namespace root\wmi -ClassName MSNdis_CurrentPacketFilter -ErrorAction Stop)) {
+            if (($f.NdisCurrentPacketFilter -band 0x20) -eq 0) { continue }
+            $nic = "$($f.InstanceName)"
+            $skip = $false
+            foreach ($a in $allowNic) { if ($a -and $nic -like "*$a*") { $skip = $true; break } }
+            if ($skip) { continue }
+            Warn 'RawSocket' "NIC in promiscuous mode (packet sniffer / raw-socket capture): $nic"
+        }
+    } catch {}
+
+    # 3. Sysmon driver-load events for capture drivers, to catch the load moment
+    #    even if the driver is later unloaded (needs Sysmon EID 6).
+    foreach ($e in (Get-EventsSafe 'Microsoft-Windows-Sysmon/Operational' 6 $LookbackMin)) {
+        try { $x = [xml]$e.ToXml() } catch { continue }
+        $img = Get-EventField $x.Event.EventData.Data @('ImageLoaded')
+        if ($img -match '(?i)windivert|npcap|npf|winpcap|pcap') {
+            Alert 'RawSocket' 'high' "packet capture/interception driver loaded (Sysmon EID6): $img"
+        }
+    }
+}
+
 # #3 -------------------------------------------------------------------------
 # Blocked call-home in the Windows Firewall log. With default-deny outbound on,
 # every beacon check-in is logged as a dropped SEND instead of hoping the sweep
@@ -834,6 +886,7 @@ $Dispatch = [ordered]@{
     InternalBeacon= { Det-InternalBeacon }
     NetworkConnect= { Det-NetworkConnect }
     MemScan       = { Det-MemScan }
+    RawSocket     = { Det-RawSocket }
     Listeners     = { Det-Listeners }
     Persistence   = { Det-Persistence }
     Firewall      = { Det-Firewall }

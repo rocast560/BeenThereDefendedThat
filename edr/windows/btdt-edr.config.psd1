@@ -68,6 +68,23 @@
     }
 
     # ------------------------------------------------------------------
+    # #1 Raw-socket / sniff-shell detection (RawSocket)
+    # The Windows analog of the Linux 'rawsock' check. A passive sniff-shell
+    # (watershell-style) opens NO socket and NO listener -- it reads packets off
+    # the wire in promiscuous mode or via a packet-interception driver, so the
+    # firewall and every connection-layer check see nothing. This hunts the
+    # mechanism it cannot hide: a promiscuous NIC, or a WinDivert/pcap driver.
+    # ------------------------------------------------------------------
+    RawSocket = @{
+        # Capture drivers that are legitimately present (e.g. you run Wireshark).
+        # WinDivert is never allowlisted by name here -- it is a strong C2 signal.
+        AllowCaptureDrivers  = @()          # e.g. @('npcap','npf')
+        # Adapter descriptions that are legitimately promiscuous (monitor NIC, some
+        # Hyper-V/VM switches, a capture box). Substring match on InstanceName.
+        AllowPromiscAdapters = @()          # e.g. @('Hyper-V','Npcap Loopback')
+    }
+
+    # ------------------------------------------------------------------
     # #3 Egress hardening (InternalBeacon + FirewallLog)
     # ------------------------------------------------------------------
     # Internal peers this host legitimately talks to (exact IP or dotted prefix,
@@ -106,6 +123,7 @@
         InternalBeacon= $true    # #3 suspicious process -> non-trusted internal peer
         NetworkConnect= $true    # #3 event-driven egress (Sysmon EID 3) - catches brief beacons
         MemScan       = $true    # #2 injected/RWX-private shellcode in memory
+        RawSocket     = $true    # #1 sniff-shell: promiscuous NIC / WinDivert/pcap driver
         Listeners     = $true    # unexpected listening ports
         Persistence   = $true    # tasks/services/Run keys/WMI diff vs T0
         Firewall      = $true    # firewall profile disabled / outbound un-blocked
